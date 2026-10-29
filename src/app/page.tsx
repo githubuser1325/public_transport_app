@@ -1,0 +1,422 @@
+"use client";
+
+import dynamic from "next/dynamic";
+import { ArrowDownUp, Clock3, LocateFixed, MapPin, Radio, Route, Search, Signal, TriangleAlert, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { Arrival, Stop } from "@/lib/gtfs";
+import { decodeTripShape, type LiveTripDetails } from "@/lib/live-arrival";
+import { mergeLiveVehicleUpdates, parseLiveTransportMessage, type LiveVehicle } from "@/lib/live-transport";
+
+const TransitMap = dynamic(() => import("@/components/TransitMap"), {
+  ssr: false,
+  loading: () => <div className="map-loading">Loading Plovdiv map...</div>,
+});
+
+type TransitResponse = {
+  source?: string;
+  liveVehiclePositions?: boolean;
+  loadedAt?: string;
+  stops: Stop[];
+  arrivals: Arrival[];
+  routes?: string[];
+  error?: string;
+};
+
+type LiveArrival = {
+  vehicle: LiveVehicle;
+  arrivalTime: number;
+  minutesAway: number;
+  delayMs: number;
+};
+
+type LiveTripResponse = { available?: boolean; trip?: LiveTripDetails | null };
+
+function delayDescription(delayMs: number | null, cancelled = false) {
+  if (cancelled) return "Cancelled";
+  if (delayMs === null) return "No live timing";
+  const minutes = Math.floor(Math.abs(delayMs) / 60_000);
+  if (minutes === 0) return "On time";
+  return `${minutes} min ${delayMs > 0 ? "late" : "early"}`;
+}
+
+function formatPlovdivTime(timestamp: number) {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Sofia",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestamp));
+}
+
+export default function Home() {
+  const [feed, setFeed] = useState<TransitResponse | null>(null);
+  const [selectedStop, setSelectedStop] = useState<Stop | null>(null);
+  const [search, setSearch] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [vehicles, setVehicles] = useState<LiveVehicle[]>([]);
+  const [streamState, setStreamState] = useState<"connecting" | "connected" | "reconnecting">("connecting");
+  const [streamInitialized, setStreamInitialized] = useState(false);
+  const [receivedAt, setReceivedAt] = useState<number | null>(null);
+  const [selectedVehicleId, setSelectedVehicleId] = useState<string | null>(null);
+  const [selectedTrip, setSelectedTrip] = useState<LiveTripDetails | null>(null);
+  const [tripLoading, setTripLoading] = useState(false);
+  const [liveArrivals, setLiveArrivals] = useState<LiveArrival[]>([]);
+  const [liveArrivalLoading, setLiveArrivalLoading] = useState(false);
+  const liveVehiclesRef = useRef<LiveVehicle[]>([]);
+  liveVehiclesRef.current = vehicles;
+  const selectedVehicle = vehicles.find((vehicle) => vehicle.id === selectedVehicleId) ?? null;
+  const stopsById = useMemo(() => new Map((feed?.stops ?? []).map((stop) => [stop.id, stop])), [feed?.stops]);
+  const tripStopKey = selectedTrip?.stops.map((stop) => stop.id).join(",") ?? "";
+  const selectedTripShape = useMemo(() => {
+    const shape = decodeTripShape(selectedTrip?.shape ?? "");
+    if (shape.length > 1 || !selectedTrip) return shape;
+    return selectedTrip.stops.flatMap((tripStop) => {
+      const stop = stopsById.get(tripStop.id);
+      return stop ? [[stop.latitude, stop.longitude] as [number, number]] : [];
+    });
+  }, [selectedTrip?.shape, tripStopKey, stopsById]);
+
+  async function refresh(stopId?: string) {
+    setLoading(true);
+    try {
+      const query = stopId ? `?stopId=${encodeURIComponent(stopId)}` : "";
+      const response = await fetch(`/api/transit${query}`, { cache: "no-store" });
+      const data = (await response.json()) as TransitResponse;
+      setFeed(data);
+      if (data.stops?.length && !selectedStop) setSelectedStop(data.stops[0]);
+    } catch {
+      setFeed({ error: "Could not reach the local transit server.", stops: [], arrivals: [] });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(selectedStop?.id), 60_000);
+    return () => window.clearInterval(timer);
+  }, [selectedStop?.id]);
+
+  useEffect(() => {
+    let active = true;
+    let socket: WebSocket | null = null;
+    let reconnectTimer = 0;
+    const socketUrl = process.env.NEXT_PUBLIC_LIVE_TRANSPORT_WS || "wss://api.livetransport.eu/plovdiv";
+
+    const connect = () => {
+      if (!active) return;
+      setStreamState("connecting");
+      socket = new WebSocket(socketUrl);
+      socket.onopen = () => active && setStreamState("connected");
+      socket.onmessage = (event) => {
+        if (!active) return;
+        const updates = parseLiveTransportMessage(event.data);
+        setVehicles((current) => mergeLiveVehicleUpdates(current, updates));
+        setReceivedAt(Date.now());
+        setStreamInitialized(true);
+      };
+      socket.onerror = () => active && setStreamState("reconnecting");
+      socket.onclose = () => {
+        if (!active) return;
+        setStreamState("reconnecting");
+        reconnectTimer = window.setTimeout(connect, 5000);
+      };
+    };
+
+    connect();
+    const pruneTimer = window.setInterval(() => {
+      setVehicles((current) => mergeLiveVehicleUpdates(current, []));
+    }, 30_000);
+
+    return () => {
+      active = false;
+      window.clearTimeout(reconnectTimer);
+      window.clearInterval(pruneTimer);
+      socket?.close();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedVehicleId) {
+      setSelectedTrip(null);
+      setTripLoading(false);
+      return;
+    }
+
+    let active = true;
+    let isFirstRequest = true;
+    const controller = new AbortController();
+    const refreshTrip = async () => {
+      if (isFirstRequest) setTripLoading(true);
+      try {
+        const query = new URLSearchParams({ vehicleId: selectedVehicleId });
+        const response = await fetch(`/api/transit/live-trip?${query}`, { cache: "no-store", signal: controller.signal });
+        const result = await response.json() as LiveTripResponse;
+        if (active) setSelectedTrip(result.available ? result.trip ?? null : null);
+      } catch {
+        if (active) setSelectedTrip(null);
+      } finally {
+        if (active) {
+          setTripLoading(false);
+          isFirstRequest = false;
+        }
+      }
+    };
+
+    void refreshTrip();
+    const timer = window.setInterval(() => void refreshTrip(), 30_000);
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [selectedVehicleId]);
+
+  useEffect(() => {
+    if (!selectedStop || !streamInitialized) {
+      setLiveArrivals([]);
+      setLiveArrivalLoading(false);
+      return;
+    }
+
+    let active = true;
+    const refreshLiveArrivals = async () => {
+      const stop = selectedStop;
+      const lineIds = new Set(feed?.routes ?? []);
+      const byLine = new Map<string, LiveVehicle[]>();
+      for (const vehicle of liveVehiclesRef.current) {
+        if (!lineIds.has(vehicle.lineId)) continue;
+        const candidates = byLine.get(vehicle.lineId) ?? [];
+        candidates.push(vehicle);
+        byLine.set(vehicle.lineId, candidates);
+      }
+
+      const distance = (vehicle: LiveVehicle) => {
+        const lat = (vehicle.latitude - stop.latitude) * 111_000;
+        const lon = (vehicle.longitude - stop.longitude) * 82_000;
+        return Math.hypot(lat, lon);
+      };
+      const nearbyCandidates = [...byLine.values()]
+        .flatMap((lineVehicles) => lineVehicles.sort((left, right) => distance(left) - distance(right)).slice(0, 2))
+        .slice(0, 10);
+      const followedVehicle = liveVehiclesRef.current.find((vehicle) => vehicle.id === selectedVehicleId && lineIds.has(vehicle.lineId));
+      const candidates = [...new Map([...(followedVehicle ? [followedVehicle] : []), ...nearbyCandidates].map((vehicle) => [vehicle.id, vehicle])).values()].slice(0, 10);
+
+      if (!candidates.length) {
+        setLiveArrivals([]);
+        return;
+      }
+
+      setLiveArrivalLoading(true);
+      const results = await Promise.all(candidates.map(async (vehicle) => {
+        const query = new URLSearchParams({ vehicleId: vehicle.id, stopId: stop.id });
+        try {
+          const response = await fetch(`/api/transit/live-arrival?${query}`, { cache: "no-store" });
+          const result = await response.json() as { available?: boolean; arrivalTime?: number; minutesAway?: number; delayMs?: number };
+          if (!result.available || result.arrivalTime === undefined || result.minutesAway === undefined || result.delayMs === undefined) return null;
+          return { vehicle, arrivalTime: result.arrivalTime, minutesAway: result.minutesAway, delayMs: result.delayMs };
+        } catch {
+          return null;
+        }
+      }));
+
+      if (active) {
+        setLiveArrivals(results.filter((arrival): arrival is LiveArrival => arrival !== null)
+          .sort((left, right) => left.arrivalTime - right.arrivalTime));
+        setLiveArrivalLoading(false);
+      }
+    };
+
+    void refreshLiveArrivals();
+    const timer = window.setInterval(() => void refreshLiveArrivals(), 30_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [feed?.routes, selectedStop, selectedVehicleId, streamInitialized]);
+
+  const filteredStops = useMemo(() => {
+    const normalized = search.trim().toLocaleLowerCase();
+    return (feed?.stops ?? []).filter((stop) => stop.name.toLocaleLowerCase().includes(normalized));
+  }, [feed?.stops, search]);
+
+  async function chooseStop(stop: Stop) {
+    setSelectedStop(stop);
+    await refresh(stop.id);
+  }
+
+  return (
+    <main className="shell">
+      <header className="topbar">
+        <a className="brand" href="#" aria-label="Plovdiv Bus Tracker home">
+          <span className="brand-mark"><span /></span>
+          <span>plovdiv<span className="brand-light">/bus</span></span>
+        </a>
+        <div className={`topbar-status ${streamState}`}><span className="status-dot" /> {streamState === "connected" ? `${vehicles.length} LIVE BUSES` : "LIVE FEED CONNECTING"}</div>
+        <button className="icon-button" type="button" title="Refresh arrivals" onClick={() => void refresh(selectedStop?.id)}>
+          <ArrowDownUp size={17} />
+        </button>
+      </header>
+
+      <section className="workspace">
+        <aside className="sidebar">
+          <div className="intro">
+            <p className="eyebrow">PLOVDIV, BULGARIA <span>·</span> {new Date().toLocaleDateString("en-GB")}</p>
+            <h1>Make the<br /><em>next bus.</em></h1>
+            <p className="subhead">Track live buses, compare arrivals, and follow each route stop by stop.</p>
+          </div>
+
+          <div className="data-note">
+            <TriangleAlert size={16} />
+            <div><strong>Live positions + scheduled service</strong><span>Bus coordinates come from LiveTransport; departures use the published timetable unless a live trip is matched.</span></div>
+          </div>
+
+          <div className="stop-section">
+            <div className="section-heading"><span>Choose a stop</span><span className="stop-count">{feed?.stops?.length ?? "--"}</span></div>
+            <label className="search-box">
+              <Search size={16} />
+              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search stops" />
+              <kbd>/</kbd>
+            </label>
+            <div className="stop-list">
+              {filteredStops.slice(0, 250).map((stop) => (
+                <button key={stop.id} className={`stop-row ${selectedStop?.id === stop.id ? "selected" : ""}`} onClick={() => void chooseStop(stop)}>
+                  <MapPin size={15} />
+                  <span>{stop.name}</span>
+                  {selectedStop?.id === stop.id && <span className="row-arrow">↗</span>}
+                </button>
+              ))}
+              {!loading && !feed?.stops?.length && (
+                <div className="empty-stops">
+                  <Signal size={20} />
+                  <strong>Transit feed not connected</strong>
+                  <span>{feed?.error ?? "Configure a verified GTFS ZIP URL to load Plovdiv stops."}</span>
+                </div>
+              )}
+              {filteredStops.length > 250 && <p className="list-limit">Showing 250 matches. Refine your search.</p>}
+            </div>
+          </div>
+          <div className="sidebar-foot"><span>SCHEDULE</span><strong>GTFS</strong><span className="foot-divider" /> <span>POSITIONS</span><strong>LIVE</strong></div>
+        </aside>
+
+        <section className="main-panel">
+          <div className="map-heading">
+            <div><p className="eyebrow">NETWORK VIEW</p><h2>{selectedStop?.name ?? "Plovdiv stops"}</h2></div>
+            <button className="locate-button" type="button" title="Center on selected stop" onClick={() => selectedStop && void chooseStop(selectedStop)}><LocateFixed size={16} /> <span>Selected stop</span></button>
+          </div>
+          <div className="map-wrap">
+            <TransitMap
+              stops={feed?.stops ?? []}
+              vehicles={vehicles}
+              routeShape={selectedTripShape}
+              selectedStopId={selectedStop?.id ?? null}
+              selectedVehicleId={selectedVehicleId}
+              onSelect={(stop) => void chooseStop(stop)}
+              onSelectVehicle={(vehicle) => setSelectedVehicleId(vehicle.id)}
+            />
+            <div className="map-legend"><span className="legend-dot stop-legend" /> Stops <span className="legend-separator" /><span className="legend-dot bus-legend" /> Buses <span className="legend-separator" /><span className="legend-ring" /> Selected</div>
+            <div className="map-corner">42°08&apos;N&nbsp; 24°45&apos;E</div>
+          </div>
+
+          {selectedVehicle && (
+            <div className="vehicle-detail">
+              <span className="vehicle-detail-route">LINE {selectedVehicle.lineId}</span>
+              <strong>{selectedVehicle.destination?.en || selectedVehicle.destination?.bg || "Direction unavailable"}</strong>
+              <span>Bus {selectedVehicle.id.split("/").at(-1)}</span>
+              <span>{selectedVehicle.speedKmh === null ? "Speed unavailable" : `${selectedVehicle.speedKmh} km/h`}</span>
+              <span>{Math.max(0, Math.floor((Date.now() - selectedVehicle.lastUpdated) / 1000))} sec old</span>
+              {liveArrivals.find((arrival) => arrival.vehicle.id === selectedVehicle.id) && (
+                <span className="vehicle-stop-eta">At this stop in {liveArrivals.find((arrival) => arrival.vehicle.id === selectedVehicle.id)?.minutesAway} min</span>
+              )}
+              <button className="clear-vehicle" type="button" title="Clear selected bus" onClick={() => setSelectedVehicleId(null)}><X size={15} /></button>
+            </div>
+          )}
+
+          {selectedVehicleId && (
+            <section className="trip-detail" aria-label="Selected bus route">
+              <div className="trip-detail-heading">
+                <div className="trip-title">
+                  <Route size={17} />
+                  <div><p className="eyebrow">LINE {selectedTrip?.lineId || selectedVehicle?.lineId || ""} · ALL STOPS</p><h3>{selectedTrip?.destination?.en || selectedTrip?.destination?.bg || selectedVehicle?.destination?.en || selectedVehicle?.destination?.bg || "Bus route"}</h3></div>
+                </div>
+                {selectedTrip && <span className={`trip-delay ${selectedTrip.cancelled ? "cancelled" : selectedTrip.delayMs !== null && selectedTrip.delayMs > 60_000 ? "late" : selectedTrip.delayMs !== null && selectedTrip.delayMs < -60_000 ? "early" : "ontime"}`}>{delayDescription(selectedTrip.stops[selectedTrip.nextStop]?.delayMs ?? selectedTrip.delayMs, selectedTrip.cancelled)}</span>}
+              </div>
+              {tripLoading && !selectedTrip ? (
+                <div className="arrival-empty trip-empty">Loading bus stops...</div>
+              ) : !selectedTrip ? (
+                <div className="arrival-empty trip-empty">{streamState !== "connected" ? "Waiting for the live trip feed..." : "Live trip details are unavailable for this bus."}</div>
+              ) : (
+                <div className="trip-stop-list">
+                  {selectedTrip.stops.map((tripStop, index) => {
+                    const stop = stopsById.get(tripStop.id);
+                    const tripFinished = selectedTrip.nextStop < 0 || selectedTrip.nextStop >= selectedTrip.stops.length;
+                    const phase = selectedTrip.cancelled ? "cancelled" : tripFinished || index < selectedTrip.nextStop ? "passed" : index === selectedTrip.nextStop ? "next" : "upcoming";
+                    return (
+                      <button
+                        key={`${tripStop.id}-${index}`}
+                        className={`trip-stop-row ${phase}`}
+                        type="button"
+                        disabled={!stop}
+                        aria-current={phase === "next" ? "step" : undefined}
+                        onClick={() => stop && void chooseStop(stop)}
+                      >
+                        <span className="trip-stop-marker"><span /></span>
+                        <span className="trip-stop-name"><strong>{stop?.name ?? `Stop ${tripStop.id}`}</strong><small>Stop ID {tripStop.id}</small></span>
+                        <span className="trip-stop-time">{formatPlovdivTime(tripStop.arrivalAt)}</span>
+                        <span className={`trip-stop-punctuality ${tripStop.delayMs === null ? "unknown" : tripStop.delayMs > 60_000 ? "late" : tripStop.delayMs < -60_000 ? "early" : "ontime"}`}>{selectedTrip.cancelled ? "Cancelled" : delayDescription(tripStop.delayMs)}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          )}
+
+          <section className="arrivals">
+            <div className="arrivals-heading">
+              <div><p className="eyebrow">SELECTED STOP</p><h3>Arrivals</h3></div>
+              <div className="arrival-meta"><Radio size={15} /><span>{receivedAt ? `Live update ${new Date(receivedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "Connecting live feed"}</span></div>
+            </div>
+            {selectedStop ? (
+              <>
+                <div className="live-arrival-section">
+                  <div className="subsection-heading"><span>LIVE BUS ETAS</span><span>{liveArrivals.length || "--"}</span></div>
+                  {liveArrivals.length ? liveArrivals.slice(0, 5).map((arrival) => (
+                    <button className="live-arrival-row" key={arrival.vehicle.id} onClick={() => setSelectedVehicleId(arrival.vehicle.id)}>
+                      <span className="route-badge live-badge">{arrival.vehicle.lineId}</span>
+                      <span className="arrival-destination">{arrival.vehicle.destination?.en || arrival.vehicle.destination?.bg || "Direction unavailable"}<small>Bus {arrival.vehicle.id.split("/").at(-1)}</small></span>
+                      <span className="arrival-time">{arrival.minutesAway === 0 ? "Due" : `${arrival.minutesAway} min`}</span>
+                      <span className="delay-label">{arrival.delayMs === 0 ? "On time" : `${Math.max(1, Math.round(Math.abs(arrival.delayMs) / 60_000))} min ${arrival.delayMs > 0 ? "late" : "early"}`}</span>
+                    </button>
+                  )) : (
+                    <div className="arrival-empty compact-empty">{liveArrivalLoading ? "Matching live buses to this stop..." : streamState !== "connected" ? "Waiting for live bus positions..." : "No currently tracked bus has this stop ahead on its trip."}</div>
+                  )}
+                </div>
+                <div className="schedule-section">
+                  <div className="subsection-heading"><span>PUBLISHED SCHEDULE</span><span>{feed?.loadedAt ? new Date(feed.loadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}</span></div>
+                  {feed?.arrivals?.length ? (
+                    <div className="arrival-table">
+                      {feed.arrivals.slice(0, 6).map((arrival) => (
+                        <div className="arrival-row" key={`${arrival.tripId}-${arrival.departureTime}`}>
+                          <span className="route-badge">{arrival.route}</span>
+                          <span className="arrival-destination">{arrival.headsign || "Direction not listed"}</span>
+                          <span className="arrival-time">{arrival.minutesAway === 0 ? "Due" : `${arrival.minutesAway} min`}</span>
+                          <span className="scheduled-time">{arrival.departureTime.slice(0, 5)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="arrival-empty">{loading ? "Checking the timetable..." : feed?.error ?? "No upcoming departures found for this stop today."}</div>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="arrival-empty">Connect a verified GTFS feed to see stops and departures.</div>
+            )}
+            <p className="arrival-disclaimer">Live ETAs use the active vehicle trip and reported delay; they can still change with traffic or service updates. Scheduled times are shown separately.</p>
+            <div className="source-credit">Live vehicle data by <a href="https://livetransport.eu/#/plovdiv" target="_blank" rel="noreferrer">LiveTransport.eu</a> · Received {receivedAt ? `${Math.max(0, Math.floor((Date.now() - receivedAt) / 1000))} sec ago` : "not yet"}</div>
+          </section>
+        </section>
+      </section>
+    </main>
+  );
+}
