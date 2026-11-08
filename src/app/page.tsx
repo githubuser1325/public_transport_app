@@ -6,7 +6,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Arrival, Stop } from "@/lib/gtfs";
 import { assessCatchability, estimateWalkingMinutes, type Coordinates } from "@/lib/catchability";
 import { decodeTripShape, type LiveTripDetails } from "@/lib/live-arrival";
-import { hasLiveStreamGoneStale, isLiveVehicleFresh, isLiveVehicleRecent, mergeLiveVehicleUpdates, parseLiveTransportMessage, type LiveVehicle } from "@/lib/live-transport";
+import { startLiveConnection } from "@/lib/live-connection";
+import { readCurrentLocation } from "@/lib/location";
+import { getVisibleLiveVehicles, hasLiveStreamGoneStale, isLiveVehicleFresh, isLiveVehicleRecent, mergeLiveVehicleUpdates, parseLiveTransportMessage, type LiveVehicle } from "@/lib/live-transport";
 
 const TransitMap = dynamic(() => import("@/components/TransitMap"), {
   ssr: false,
@@ -79,7 +81,7 @@ export default function Home() {
   const lastPositionUpdateRef = useRef<number | null>(null);
   const feedRequestControllerRef = useRef<AbortController | null>(null);
   liveVehiclesRef.current = vehicles;
-  const selectedVehicle = vehicles.find((vehicle) => vehicle.id === selectedVehicleId) ?? null;
+  const selectedVehicle = vehicles.find((vehicle) => vehicle.id === selectedVehicleId && isLiveVehicleRecent(vehicle)) ?? null;
   const stopsById = useMemo(() => new Map((feed?.stops ?? []).map((stop) => [stop.id, stop])), [feed?.stops]);
   const tripStopKey = selectedTrip?.stops.map((stop) => stop.id).join(",") ?? "";
   const selectedTripShape = useMemo(() => {
@@ -127,23 +129,17 @@ export default function Home() {
   }, [selectedStop?.id]);
 
   useEffect(() => {
-    let active = true;
-    let socket: WebSocket | null = null;
-    let reconnectTimer = 0;
     let connectionStartedAt = Date.now();
     const socketUrl = process.env.NEXT_PUBLIC_LIVE_TRANSPORT_WS || "wss://api.livetransport.eu/plovdiv";
-
-    const connect = () => {
-      if (!active) return;
-      connectionStartedAt = Date.now();
-      setStreamState("connecting");
-      socket = new WebSocket(socketUrl);
-      socket.onopen = () => {
-        if (active) setStreamState("connecting");
-      };
-      socket.onmessage = (event) => {
-        if (!active) return;
-        const updates = parseLiveTransportMessage(event.data);
+    const stopConnection = startLiveConnection({
+      url: socketUrl,
+      createSocket: (url) => new WebSocket(url),
+      onStatus: (status) => {
+        if (status === "connecting") connectionStartedAt = Date.now();
+        setStreamState(status);
+      },
+      onMessage: (payload) => {
+        const updates = parseLiveTransportMessage(payload);
         const now = Date.now();
         const freshUpdates = updates.filter((vehicle) => isLiveVehicleFresh(vehicle, now));
         setVehicles((current) => mergeLiveVehicleUpdates(current, freshUpdates, now));
@@ -152,16 +148,8 @@ export default function Home() {
         setStreamState("connected");
         setReceivedAt(now);
         setStreamInitialized(true);
-      };
-      socket.onerror = () => active && setStreamState("reconnecting");
-      socket.onclose = () => {
-        if (!active) return;
-        setStreamState("reconnecting");
-        reconnectTimer = window.setTimeout(connect, 5000);
-      };
-    };
-
-    connect();
+      },
+    });
     const pruneTimer = window.setInterval(() => {
       const now = Date.now();
       setVehicles((current) => mergeLiveVehicleUpdates(current, [], now));
@@ -172,15 +160,13 @@ export default function Home() {
     }, 15_000);
 
     return () => {
-      active = false;
-      window.clearTimeout(reconnectTimer);
+      stopConnection();
       window.clearInterval(pruneTimer);
-      socket?.close();
     };
   }, []);
 
   useEffect(() => {
-    if (selectedVehicleId && !vehicles.some((vehicle) => vehicle.id === selectedVehicleId)) {
+    if (selectedVehicleId && !vehicles.some((vehicle) => vehicle.id === selectedVehicleId && isLiveVehicleRecent(vehicle))) {
       setSelectedVehicleId(null);
     }
   }, [selectedVehicleId, vehicles]);
@@ -334,24 +320,15 @@ export default function Home() {
   }
 
   function requestLocation() {
-    if (!navigator.geolocation) {
-      setLocationMessage("Location is not available in this browser.");
-      return;
-    }
-
     setLocationMessage("Checking your location…");
-    navigator.geolocation.getCurrentPosition(
-      ({ coords }) => {
-        setUserLocation({ latitude: coords.latitude, longitude: coords.longitude });
+    readCurrentLocation(navigator.geolocation, (result) => {
+      if (result.status === "success") {
+        setUserLocation(result.coordinates);
         setLocationMessage("Location stays on this device; walk time is approximate.");
-      },
-      (error) => {
-        setLocationMessage(error.code === error.PERMISSION_DENIED
-          ? "Location access was declined. You can enable it in browser settings."
-          : "Could not get your location. Try again.");
-      },
-      { enableHighAccuracy: false, maximumAge: 60_000, timeout: 10_000 },
-    );
+      } else {
+        setLocationMessage(result.message);
+      }
+    });
   }
 
   return (
@@ -361,7 +338,7 @@ export default function Home() {
           <span className="brand-mark"><span /></span>
           <span>plovdiv<span className="brand-light">/bus</span></span>
         </a>
-        <div className={`topbar-status ${streamState}`}><span className="status-dot" /> {streamState === "connected" ? `${vehicles.length} LIVE BUSES` : streamState === "stale" ? "GPS POSITIONS STALE" : streamState === "reconnecting" ? "LIVE FEED RECONNECTING" : "LIVE FEED CONNECTING"}</div>
+        <div className={`topbar-status ${streamState}`}><span className="status-dot" /> {streamState === "connected" ? `${getVisibleLiveVehicles(vehicles).length} LIVE BUSES` : streamState === "stale" ? "GPS POSITIONS STALE" : streamState === "reconnecting" ? "LIVE FEED RECONNECTING" : "LIVE FEED CONNECTING"}</div>
         <button className="icon-button" type="button" title="Refresh arrivals" onClick={() => void refresh(selectedStop?.id)}>
           <ArrowDownUp size={17} />
         </button>
@@ -416,7 +393,7 @@ export default function Home() {
           <div className="map-wrap">
             <TransitMap
               stops={feed?.stops ?? []}
-              vehicles={vehicles}
+              vehicles={getVisibleLiveVehicles(vehicles)}
               routeShape={selectedTripShape}
               selectedStopId={selectedStop?.id ?? null}
               selectedVehicleId={selectedVehicleId}
@@ -543,7 +520,7 @@ export default function Home() {
               <div className="arrival-empty">Connect a verified GTFS feed to see stops and departures.</div>
             )}
             <p className="arrival-disclaimer">Live ETAs use the active vehicle trip and reported delay; they can still change with traffic or service updates. Scheduled times are shown separately.</p>
-            <div className="source-credit">Schedules by <a href="https://gtfs.livetransport.eu/" target="_blank" rel="noreferrer">LiveTransport.eu (CC BY 4.0)</a> · Live vehicle data by <a href="https://livetransport.eu/#/plovdiv" target="_blank" rel="noreferrer">LiveTransport.eu</a> · Received {receivedAt ? `${Math.max(0, Math.floor((Date.now() - receivedAt) / 1000))} sec ago` : "not yet"}</div>
+            <div className="source-credit">Schedules by <a href="https://gtfs.livetransport.eu/" target="_blank" rel="noreferrer">LiveTransport.eu (CC BY 4.0)</a> · Municipal catalog: <a href="https://sipbg.gov.bg/bgnap/portal/en/catalog/1bb57544-8bb4-4f77-8d65-5d31ffdee221" target="_blank" rel="noreferrer">OP OKT via Bulgarian NAP</a> · Live positions by <a href="https://livetransport.eu/#/plovdiv" target="_blank" rel="noreferrer">LiveTransport.eu</a> · Received {receivedAt ? `${Math.max(0, Math.floor((Date.now() - receivedAt) / 1000))} sec ago` : "not yet"}</div>
           </section>
         </section>
       </section>

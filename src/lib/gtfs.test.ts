@@ -3,7 +3,9 @@ import test from "node:test";
 import { getUpcomingArrivals, parseGtfsTime } from "./gtfs";
 import { assessCatchability, estimateWalkingMinutes } from "./catchability";
 import { decodeTripShape, getLiveStopArrival, matchesLiveTripLine, normalizeLiveTrip } from "./live-arrival";
-import { hasLiveStreamGoneStale, isLiveVehicleFresh, isLiveVehicleRecent, mergeLiveVehicleUpdates, parseLiveTransportMessage } from "./live-transport";
+import { getVisibleLiveVehicles, hasLiveStreamGoneStale, isLiveVehicleFresh, isLiveVehicleRecent, mergeLiveVehicleUpdates, parseLiveTransportMessage, type LiveVehicle } from "./live-transport";
+import { startLiveConnection, type LiveSocket } from "./live-connection";
+import { readCurrentLocation, type GeolocationPort, type LocationResult } from "./location";
 
 test("parses GTFS times, including trips after midnight", () => {
   assert.equal(parseGtfsTime("07:05:09"), 25_509);
@@ -129,6 +131,85 @@ test("marks an open feed stale when it never delivers GPS or stops updating", ()
   assert.equal(hasLiveStreamGoneStale(null, 1_000_000, 1_030_001), true);
   assert.equal(hasLiveStreamGoneStale(1_000_000, 1_089_999, 1_090_000), false);
   assert.equal(hasLiveStreamGoneStale(1_000_000, 1_090_001, 1_090_001), true);
+});
+
+test("does not expose old last-known bus positions as live map markers", () => {
+  const vehicle: LiveVehicle = {
+    id: "bus-1", type: "bus", lineId: "4", blockId: "", destination: null, delayMs: null,
+    latitude: 42.1, longitude: 24.7, bearing: null, speedKmh: null, lastUpdated: 1_000_000,
+  };
+  assert.equal(getVisibleLiveVehicles([vehicle], 1_089_999).length, 1);
+  assert.equal(getVisibleLiveVehicles([vehicle], 1_090_001).length, 0);
+});
+
+test("reconnects after a socket close and accepts GPS updates from the recovered connection", () => {
+  const sockets: LiveSocket[] = [];
+  const states: string[] = [];
+  const messages: unknown[] = [];
+  let retry: (() => void) | undefined;
+  let cancelled = false;
+  const stop = startLiveConnection({
+    url: "wss://example.test/feed",
+    createSocket: () => {
+      const socket: LiveSocket = { onmessage: null, onerror: null, onclose: null, close() {} };
+      sockets.push(socket);
+      return socket;
+    },
+    onStatus: (state) => states.push(state),
+    onMessage: (payload) => messages.push(payload),
+    retryDelayMs: 5,
+    schedule: (callback) => {
+      retry = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    },
+    cancel: () => { cancelled = true; },
+  });
+
+  sockets[0].onclose?.(new CloseEvent("close"));
+  assert.deepEqual(states, ["connecting", "reconnecting"]);
+  assert.ok(retry);
+  retry();
+  assert.equal(sockets.length, 2);
+  const recoveredGps = { data: [["bus", "gps"]] };
+  sockets[1].onmessage?.(new MessageEvent("message", { data: recoveredGps }));
+  assert.deepEqual(messages, [recoveredGps]);
+  stop();
+  assert.equal(cancelled, true);
+});
+
+test("handles geolocation approval, refusal, timeout, unavailability and local walk calculation", () => {
+  const origin = { latitude: 42.12793, longitude: 24.70177 };
+  const nearbyStop = { latitude: 42.13293, longitude: 24.70177 };
+  const getResult = (geolocation: GeolocationPort | undefined) => {
+    let result: LocationResult | undefined;
+    readCurrentLocation(geolocation, (value) => { result = value; });
+    return result;
+  };
+  const approved: GeolocationPort = {
+    getCurrentPosition: (success) => success({ coords: origin }),
+  };
+  const denied: GeolocationPort = {
+    getCurrentPosition: (_success, error) => error({ code: 1 }),
+  };
+  const unavailable: GeolocationPort = {
+    getCurrentPosition: (_success, error) => error({ code: 2 }),
+  };
+  const timeout: GeolocationPort = {
+    getCurrentPosition: (_success, error) => error({ code: 3 }),
+  };
+
+  const approvedResult = getResult(approved);
+  assert.deepEqual(approvedResult, { status: "success", coordinates: origin });
+  assert.equal(estimateWalkingMinutes(origin, nearbyStop), 9);
+  const deniedResult = getResult(denied);
+  const unavailableResult = getResult(unavailable);
+  const timeoutResult = getResult(timeout);
+  const missingResult = getResult(undefined);
+  assert.equal(deniedResult?.status, "error");
+  assert.match(deniedResult?.status === "error" ? deniedResult.message : "", /declined/i);
+  assert.match(unavailableResult?.status === "error" ? unavailableResult.message : "", /Could not get/);
+  assert.match(timeoutResult?.status === "error" ? timeoutResult.message : "", /timed out/i);
+  assert.match(missingResult?.status === "error" ? missingResult.message : "", /not available/i);
 });
 
 test("calculates a realtime stop ETA only when the stop is still ahead", () => {

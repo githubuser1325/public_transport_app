@@ -27,6 +27,10 @@ export function isLiveVehicleRecent(vehicle: LiveVehicle, now = Date.now()): boo
   return age >= -allowedClockSkewMs && age <= recentPositionAfterMs;
 }
 
+export function getVisibleLiveVehicles(vehicles: LiveVehicle[], now = Date.now()): LiveVehicle[] {
+  return vehicles.filter((vehicle) => isLiveVehicleRecent(vehicle, now));
+}
+
 export function hasLiveStreamGoneStale(lastPositionAt: number | null, connectedAt: number, now = Date.now()): boolean {
   const lastSignalAt = lastPositionAt ?? connectedAt;
   const timeout = lastPositionAt === null ? noInitialPositionTimeoutMs : recentPositionAfterMs;
