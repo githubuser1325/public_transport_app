@@ -525,7 +525,7 @@ export default function Home() {
               <div className="arrival-empty">Connect a verified GTFS feed to see stops and departures.</div>
             )}
             <p className="arrival-disclaimer">Live ETAs use the active vehicle trip and reported delay; they can still change with traffic or service updates. Scheduled times are shown separately.</p>
-            <div className="source-credit">Schedules by <a href="https://gtfs.livetransport.eu/" target="_blank" rel="noreferrer">LiveTransport.eu (CC BY 4.0)</a> · Municipal catalog: <a href="https://sipbg.gov.bg/bgnap/portal/en/catalog/1bb57544-8bb4-4f77-8d65-5d31ffdee221" target="_blank" rel="noreferrer">OP OKT via Bulgarian NAP</a> · Live positions by <a href="https://livetransport.eu/#/plovdiv" target="_blank" rel="noreferrer">LiveTransport.eu</a> · Received {receivedAt ? `${Math.max(0, Math.floor((Date.now() - receivedAt) / 1000))} sec ago` : "not yet"}</div>
+            <div className="source-credit">Schedules: <a href="https://gtfs.livetransport.eu/" target="_blank" rel="noreferrer">LiveTransport.eu</a> · <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noreferrer">CC BY 4.0</a> · Data adapted for display. Municipal catalog: <a href="https://sipbg.gov.bg/bgnap/portal/en/catalog/1bb57544-8bb4-4f77-8d65-5d31ffdee221" target="_blank" rel="noreferrer">OP OKT via Bulgarian NAP</a> · Live positions by <a href="https://livetransport.eu/#/plovdiv" target="_blank" rel="noreferrer">LiveTransport.eu</a> · Received {receivedAt ? `${Math.max(0, Math.floor((Date.now() - receivedAt) / 1000))} sec ago` : "not yet"}</div>
           </section>
         </section>
       </section>
