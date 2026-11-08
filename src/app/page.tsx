@@ -59,6 +59,7 @@ function formatPlovdivTime(timestamp: number) {
 
 export default function Home() {
   const [feed, setFeed] = useState<TransitResponse | null>(null);
+  const [todayLabel, setTodayLabel] = useState("");
   const [selectedStop, setSelectedStop] = useState<Stop | null>(null);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -118,6 +119,10 @@ export default function Home() {
       if (!controller.signal.aborted) setLoading(false);
     }
   }
+
+  useEffect(() => {
+    setTodayLabel(new Date().toLocaleDateString("en-GB"));
+  }, []);
 
   useEffect(() => {
     void refresh();
@@ -347,7 +352,7 @@ export default function Home() {
       <section className="workspace">
         <aside className="sidebar">
           <div className="intro">
-            <p className="eyebrow">PLOVDIV, BULGARIA <span>·</span> {new Date().toLocaleDateString("en-GB")}</p>
+            <p className="eyebrow">PLOVDIV, BULGARIA {todayLabel && <><span>·</span> {todayLabel}</>}</p>
             <h1>Make the<br /><em>next bus.</em></h1>
             <p className="subhead">Track live buses, compare arrivals, and follow each route stop by stop.</p>
           </div>

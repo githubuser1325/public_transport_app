@@ -62,6 +62,15 @@ test("uses the selected walking pace and detour distance when estimating arrival
   assert.equal(estimateWalkingMinutes(from, to, 4.8, 0.9), null);
 });
 
+test("keeps catchability conservative at the walking-time and buffer boundaries", () => {
+  assert.equal(assessCatchability(4, 4, 0), "tight");
+  assert.equal(assessCatchability(6, 4, 2), "tight");
+  assert.equal(assessCatchability(7, 4, 2), "comfortable");
+  assert.equal(assessCatchability(3, 4, 10), "unlikely");
+  assert.equal(assessCatchability(Number.NaN, 4, 2), null);
+  assert.equal(assessCatchability(4, -1, 2), null);
+});
+
 test("parses bus positions and ignores other vehicle types", () => {
   const vehicles = parseLiveTransportMessage(JSON.stringify({
     timestamp: 100_000,
@@ -146,7 +155,7 @@ test("reconnects after a socket close and accepts GPS updates from the recovered
   const sockets: LiveSocket[] = [];
   const states: string[] = [];
   const messages: unknown[] = [];
-  let retry: (() => void) | undefined;
+  const retries: Array<() => void> = [];
   let cancelled = false;
   const stop = startLiveConnection({
     url: "wss://example.test/feed",
@@ -159,20 +168,23 @@ test("reconnects after a socket close and accepts GPS updates from the recovered
     onMessage: (payload) => messages.push(payload),
     retryDelayMs: 5,
     schedule: (callback) => {
-      retry = callback;
+      retries.push(callback);
       return 1 as unknown as ReturnType<typeof setTimeout>;
     },
     cancel: () => { cancelled = true; },
   });
 
+  sockets[0].onerror?.(new Event("error"));
   sockets[0].onclose?.(new CloseEvent("close"));
-  assert.deepEqual(states, ["connecting", "reconnecting"]);
-  assert.ok(retry);
-  retry();
+  sockets[0].onclose?.(new CloseEvent("close"));
+  assert.equal(retries.length, 1, "a disconnected socket should queue only one reconnect");
+  assert.equal(states.at(-1), "reconnecting");
+  retries[0]();
   assert.equal(sockets.length, 2);
   const recoveredGps = { data: [["bus", "gps"]] };
   sockets[1].onmessage?.(new MessageEvent("message", { data: recoveredGps }));
   assert.deepEqual(messages, [recoveredGps]);
+  sockets[1].onclose?.(new CloseEvent("close"));
   stop();
   assert.equal(cancelled, true);
 });
@@ -212,6 +224,26 @@ test("handles geolocation approval, refusal, timeout, unavailability and local w
   assert.match(missingResult?.status === "error" ? missingResult.message : "", /not available/i);
 });
 
+test("allows another location attempt after the user previously denied access", () => {
+  const origin = { latitude: 42.12793, longitude: 24.70177 };
+  let attempts = 0;
+  const retryingLocation: GeolocationPort = {
+    getCurrentPosition: (success, error) => {
+      attempts += 1;
+      if (attempts === 1) error({ code: 1 });
+      else success({ coords: origin });
+    },
+  };
+  const results: LocationResult[] = [];
+
+  readCurrentLocation(retryingLocation, (result) => results.push(result));
+  readCurrentLocation(retryingLocation, (result) => results.push(result));
+
+  assert.equal(attempts, 2);
+  assert.equal(results[0].status, "error");
+  assert.deepEqual(results[1], { status: "success", coordinates: origin });
+});
+
 test("calculates a realtime stop ETA only when the stop is still ahead", () => {
   const result = getLiveStopArrival({
     nextStop: 1,
@@ -224,6 +256,8 @@ test("calculates a realtime stop ETA only when the stop is still ahead", () => {
   assert.equal(getLiveStopArrival({ nextStop: -1, delay: 0, trip: { stops: [{ id: "B", scheduled: 1_100_000 }] } }, "B", 1_000_000), null);
   assert.equal(getLiveStopArrival({ nextStop: 0, delay: 0, trip: { stops: [{ id: "B", scheduled: 1_000_000 + 181 * 60_000 }] } }, "B", 1_000_000), null);
   assert.equal(getLiveStopArrival({ nextStop: 0, delay: 0, trip: { stops: [{ id: "B", scheduled: 1_000_000 - 5 * 60_000 - 1 }] } }, "B", 1_000_000), null);
+  assert.equal(getLiveStopArrival({ nextStop: 0, delay: "cancelled", trip: { stops: [{ id: "B", scheduled: 1_100_000 }] } }, "B", 1_000_000), null);
+  assert.equal(getLiveStopArrival({ nextStop: 0, trip: { stops: [{ id: "B", scheduled: 1_100_000 }] } }, "B", 1_000_000), null);
 });
 
 test("uses a stop-specific delay instead of the trip-wide delay for its ETA", () => {

@@ -32,7 +32,11 @@ export function startLiveConnection(options: LiveConnectionOptions): () => void 
     socket.onclose = () => {
       if (!active) return;
       options.onStatus("reconnecting");
-      retryTimer = schedule(connect, retryDelayMs);
+      if (retryTimer !== null) return;
+      retryTimer = schedule(() => {
+        retryTimer = null;
+        connect();
+      }, retryDelayMs);
     };
   };
 
