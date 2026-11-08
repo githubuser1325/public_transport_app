@@ -14,7 +14,7 @@
     "fflate": "^0.8.2",
     "leaflet": "^1.9.4",
     "lucide-react": "^0.468.0",
-    "next": "^15.1.4",
+    "next": "^15.5.29",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-leaflet": "^5.0.0"
@@ -26,5 +26,8 @@
     "@types/react-dom": "^19.0.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
+  },
+  "overrides": {
+    "postcss": "^8.5.23"
   }
 }

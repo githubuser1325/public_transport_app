@@ -44,11 +44,19 @@ export function getUpcomingArrivals(rows: Array<{
         route: row.route,
         headsign: row.headsign,
         departureTime: row.departureTime,
+        departureSeconds,
         minutesAway: Math.ceil((departureSeconds - currentSeconds) / 60),
       };
     })
-    .sort((left, right) => left.minutesAway - right.minutesAway)
-    .slice(0, limit);
+    .sort((left, right) => left.departureSeconds - right.departureSeconds)
+    .slice(0, limit)
+    .map((arrival) => ({
+      tripId: arrival.tripId,
+      route: arrival.route,
+      headsign: arrival.headsign,
+      departureTime: arrival.departureTime,
+      minutesAway: arrival.minutesAway,
+    }));
 }
 
 export function getPlovdivClock(date = new Date()): { date: string; seconds: number; weekday: number } {

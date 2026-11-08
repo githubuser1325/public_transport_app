@@ -4,8 +4,9 @@ import dynamic from "next/dynamic";
 import { ArrowDownUp, Clock3, LocateFixed, MapPin, Radio, Route, Search, Signal, TriangleAlert, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Arrival, Stop } from "@/lib/gtfs";
+import { assessCatchability, estimateWalkingMinutes, type Coordinates } from "@/lib/catchability";
 import { decodeTripShape, type LiveTripDetails } from "@/lib/live-arrival";
-import { mergeLiveVehicleUpdates, parseLiveTransportMessage, type LiveVehicle } from "@/lib/live-transport";
+import { hasLiveStreamGoneStale, isLiveVehicleFresh, isLiveVehicleRecent, mergeLiveVehicleUpdates, parseLiveTransportMessage, type LiveVehicle } from "@/lib/live-transport";
 
 const TransitMap = dynamic(() => import("@/components/TransitMap"), {
   ssr: false,
@@ -31,6 +32,13 @@ type LiveArrival = {
 
 type LiveTripResponse = { available?: boolean; trip?: LiveTripDetails | null };
 
+function getCatchability(minutesUntilBus: number, walkingMinutes: number, bufferMinutes: number) {
+  const status = assessCatchability(minutesUntilBus, walkingMinutes, bufferMinutes);
+  if (!status) return null;
+  const timing = status === "comfortable" ? "enough time" : status === "tight" ? "tight" : "too late";
+  return { status, text: `Walk ${walkingMinutes} min · ${timing}` };
+}
+
 function delayDescription(delayMs: number | null, cancelled = false) {
   if (cancelled) return "Cancelled";
   if (delayMs === null) return "No live timing";
@@ -53,15 +61,23 @@ export default function Home() {
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [vehicles, setVehicles] = useState<LiveVehicle[]>([]);
-  const [streamState, setStreamState] = useState<"connecting" | "connected" | "reconnecting">("connecting");
+  const [streamState, setStreamState] = useState<"connecting" | "connected" | "reconnecting" | "stale">("connecting");
   const [streamInitialized, setStreamInitialized] = useState(false);
   const [receivedAt, setReceivedAt] = useState<number | null>(null);
   const [selectedVehicleId, setSelectedVehicleId] = useState<string | null>(null);
   const [selectedTrip, setSelectedTrip] = useState<LiveTripDetails | null>(null);
   const [tripLoading, setTripLoading] = useState(false);
+  const [tripError, setTripError] = useState("");
   const [liveArrivals, setLiveArrivals] = useState<LiveArrival[]>([]);
   const [liveArrivalLoading, setLiveArrivalLoading] = useState(false);
+  const [liveArrivalError, setLiveArrivalError] = useState("");
+  const [userLocation, setUserLocation] = useState<Coordinates | null>(null);
+  const [locationMessage, setLocationMessage] = useState("");
+  const [walkingSpeedKmh, setWalkingSpeedKmh] = useState(4.8);
+  const [bufferMinutes, setBufferMinutes] = useState(2);
   const liveVehiclesRef = useRef<LiveVehicle[]>([]);
+  const lastPositionUpdateRef = useRef<number | null>(null);
+  const feedRequestControllerRef = useRef<AbortController | null>(null);
   liveVehiclesRef.current = vehicles;
   const selectedVehicle = vehicles.find((vehicle) => vehicle.id === selectedVehicleId) ?? null;
   const stopsById = useMemo(() => new Map((feed?.stops ?? []).map((stop) => [stop.id, stop])), [feed?.stops]);
@@ -76,42 +92,65 @@ export default function Home() {
   }, [selectedTrip?.shape, tripStopKey, stopsById]);
 
   async function refresh(stopId?: string) {
+    feedRequestControllerRef.current?.abort();
+    const controller = new AbortController();
+    feedRequestControllerRef.current = controller;
     setLoading(true);
     try {
       const query = stopId ? `?stopId=${encodeURIComponent(stopId)}` : "";
-      const response = await fetch(`/api/transit${query}`, { cache: "no-store" });
+      const response = await fetch(`/api/transit${query}`, { cache: "no-store", signal: controller.signal });
       const data = (await response.json()) as TransitResponse;
+      if (!response.ok) throw new Error(data.error || "Transit schedule is temporarily unavailable.");
+      if (controller.signal.aborted) return;
       setFeed(data);
       if (data.stops?.length && !selectedStop) setSelectedStop(data.stops[0]);
     } catch {
-      setFeed({ error: "Could not reach the local transit server.", stops: [], arrivals: [] });
+      if (!controller.signal.aborted) setFeed((current) => ({
+        stops: current?.stops ?? [],
+        arrivals: [],
+        routes: [],
+        loadedAt: current?.loadedAt,
+        error: "Could not load the transit schedule. Live vehicle positions may still be available.",
+      }));
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
   }
 
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => void refresh(selectedStop?.id), 60_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      feedRequestControllerRef.current?.abort();
+    };
   }, [selectedStop?.id]);
 
   useEffect(() => {
     let active = true;
     let socket: WebSocket | null = null;
     let reconnectTimer = 0;
+    let connectionStartedAt = Date.now();
     const socketUrl = process.env.NEXT_PUBLIC_LIVE_TRANSPORT_WS || "wss://api.livetransport.eu/plovdiv";
 
     const connect = () => {
       if (!active) return;
+      connectionStartedAt = Date.now();
       setStreamState("connecting");
       socket = new WebSocket(socketUrl);
-      socket.onopen = () => active && setStreamState("connected");
+      socket.onopen = () => {
+        if (active) setStreamState("connecting");
+      };
       socket.onmessage = (event) => {
         if (!active) return;
         const updates = parseLiveTransportMessage(event.data);
-        setVehicles((current) => mergeLiveVehicleUpdates(current, updates));
-        setReceivedAt(Date.now());
+        const now = Date.now();
+        const freshUpdates = updates.filter((vehicle) => isLiveVehicleFresh(vehicle, now));
+        setVehicles((current) => mergeLiveVehicleUpdates(current, freshUpdates, now));
+        if (!freshUpdates.some((vehicle) => isLiveVehicleRecent(vehicle, now))) return;
+        lastPositionUpdateRef.current = now;
+        setStreamState("connected");
+        setReceivedAt(now);
         setStreamInitialized(true);
       };
       socket.onerror = () => active && setStreamState("reconnecting");
@@ -124,8 +163,13 @@ export default function Home() {
 
     connect();
     const pruneTimer = window.setInterval(() => {
-      setVehicles((current) => mergeLiveVehicleUpdates(current, []));
-    }, 30_000);
+      const now = Date.now();
+      setVehicles((current) => mergeLiveVehicleUpdates(current, [], now));
+      const lastPositionUpdate = lastPositionUpdateRef.current;
+      if (hasLiveStreamGoneStale(lastPositionUpdate, connectionStartedAt, now)) {
+        setStreamState((state) => state === "reconnecting" ? state : "stale");
+      }
+    }, 15_000);
 
     return () => {
       active = false;
@@ -136,9 +180,16 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (selectedVehicleId && !vehicles.some((vehicle) => vehicle.id === selectedVehicleId)) {
+      setSelectedVehicleId(null);
+    }
+  }, [selectedVehicleId, vehicles]);
+
+  useEffect(() => {
     if (!selectedVehicleId) {
       setSelectedTrip(null);
       setTripLoading(false);
+      setTripError("");
       return;
     }
 
@@ -148,12 +199,23 @@ export default function Home() {
     const refreshTrip = async () => {
       if (isFirstRequest) setTripLoading(true);
       try {
-        const query = new URLSearchParams({ vehicleId: selectedVehicleId });
+        const expectedLineId = vehicles.find((vehicle) => vehicle.id === selectedVehicleId)?.lineId;
+        if (!expectedLineId) {
+          if (active) setSelectedTrip(null);
+          return;
+        }
+        const query = new URLSearchParams({ vehicleId: selectedVehicleId, lineId: expectedLineId });
         const response = await fetch(`/api/transit/live-trip?${query}`, { cache: "no-store", signal: controller.signal });
         const result = await response.json() as LiveTripResponse;
-        if (active) setSelectedTrip(result.available ? result.trip ?? null : null);
+        if (active) {
+          setSelectedTrip(response.ok && result.available ? result.trip ?? null : null);
+          setTripError(response.ok ? "" : "Live trip details are temporarily unavailable.");
+        }
       } catch {
-        if (active) setSelectedTrip(null);
+        if (active) {
+          setSelectedTrip(null);
+          setTripError("Live trip details are temporarily unavailable.");
+        }
       } finally {
         if (active) {
           setTripLoading(false);
@@ -175,16 +237,25 @@ export default function Home() {
     if (!selectedStop || !streamInitialized) {
       setLiveArrivals([]);
       setLiveArrivalLoading(false);
+      setLiveArrivalError("");
       return;
     }
 
     let active = true;
+    let requestController: AbortController | null = null;
+    setLiveArrivals([]);
+    setLiveArrivalError("");
     const refreshLiveArrivals = async () => {
+      requestController?.abort();
+      const controller = new AbortController();
+      requestController = controller;
+      const isCurrentRequest = () => active && requestController === controller && !controller.signal.aborted;
       const stop = selectedStop;
       const lineIds = new Set(feed?.routes ?? []);
       const byLine = new Map<string, LiveVehicle[]>();
+      const now = Date.now();
       for (const vehicle of liveVehiclesRef.current) {
-        if (!lineIds.has(vehicle.lineId)) continue;
+        if (!lineIds.has(vehicle.lineId) || !isLiveVehicleRecent(vehicle, now)) continue;
         const candidates = byLine.get(vehicle.lineId) ?? [];
         candidates.push(vehicle);
         byLine.set(vehicle.lineId, candidates);
@@ -202,26 +273,37 @@ export default function Home() {
       const candidates = [...new Map([...(followedVehicle ? [followedVehicle] : []), ...nearbyCandidates].map((vehicle) => [vehicle.id, vehicle])).values()].slice(0, 10);
 
       if (!candidates.length) {
-        setLiveArrivals([]);
+        if (isCurrentRequest()) {
+          setLiveArrivals([]);
+          setLiveArrivalError("");
+          setLiveArrivalLoading(false);
+        }
         return;
       }
 
       setLiveArrivalLoading(true);
       const results = await Promise.all(candidates.map(async (vehicle) => {
-        const query = new URLSearchParams({ vehicleId: vehicle.id, stopId: stop.id });
+        const query = new URLSearchParams({ vehicleId: vehicle.id, lineId: vehicle.lineId, stopId: stop.id });
         try {
-          const response = await fetch(`/api/transit/live-arrival?${query}`, { cache: "no-store" });
+          const response = await fetch(`/api/transit/live-arrival?${query}`, { cache: "no-store", signal: controller.signal });
+          if (!response.ok) return { arrival: null, failed: true };
           const result = await response.json() as { available?: boolean; arrivalTime?: number; minutesAway?: number; delayMs?: number };
-          if (!result.available || result.arrivalTime === undefined || result.minutesAway === undefined || result.delayMs === undefined) return null;
-          return { vehicle, arrivalTime: result.arrivalTime, minutesAway: result.minutesAway, delayMs: result.delayMs };
+          if (!result.available || result.arrivalTime === undefined || result.minutesAway === undefined || result.delayMs === undefined) {
+            return { arrival: null, failed: false };
+          }
+          return { arrival: { vehicle, arrivalTime: result.arrivalTime, minutesAway: result.minutesAway, delayMs: result.delayMs }, failed: false };
         } catch {
-          return null;
+          return { arrival: null, failed: !controller.signal.aborted };
         }
       }));
 
-      if (active) {
-        setLiveArrivals(results.filter((arrival): arrival is LiveArrival => arrival !== null)
-          .sort((left, right) => left.arrivalTime - right.arrivalTime));
+      if (isCurrentRequest()) {
+        const arrivals = results.flatMap((result) => result.arrival ? [result.arrival] : [])
+          .sort((left, right) => left.arrivalTime - right.arrivalTime);
+        setLiveArrivals(arrivals);
+        setLiveArrivalError(!arrivals.length && results.some((result) => result.failed)
+          ? "Live ETA data is temporarily unavailable. Check the scheduled times below."
+          : "");
         setLiveArrivalLoading(false);
       }
     };
@@ -230,6 +312,7 @@ export default function Home() {
     const timer = window.setInterval(() => void refreshLiveArrivals(), 30_000);
     return () => {
       active = false;
+      requestController?.abort();
       window.clearInterval(timer);
     };
   }, [feed?.routes, selectedStop, selectedVehicleId, streamInitialized]);
@@ -238,10 +321,37 @@ export default function Home() {
     const normalized = search.trim().toLocaleLowerCase();
     return (feed?.stops ?? []).filter((stop) => stop.name.toLocaleLowerCase().includes(normalized));
   }, [feed?.stops, search]);
+  const walkingMinutesToStop = userLocation && selectedStop
+    ? estimateWalkingMinutes(userLocation, selectedStop, walkingSpeedKmh)
+    : null;
 
   async function chooseStop(stop: Stop) {
+    if (stop.id === selectedStop?.id) {
+      await refresh(stop.id);
+      return;
+    }
     setSelectedStop(stop);
-    await refresh(stop.id);
+  }
+
+  function requestLocation() {
+    if (!navigator.geolocation) {
+      setLocationMessage("Location is not available in this browser.");
+      return;
+    }
+
+    setLocationMessage("Checking your location…");
+    navigator.geolocation.getCurrentPosition(
+      ({ coords }) => {
+        setUserLocation({ latitude: coords.latitude, longitude: coords.longitude });
+        setLocationMessage("Location stays on this device; walk time is approximate.");
+      },
+      (error) => {
+        setLocationMessage(error.code === error.PERMISSION_DENIED
+          ? "Location access was declined. You can enable it in browser settings."
+          : "Could not get your location. Try again.");
+      },
+      { enableHighAccuracy: false, maximumAge: 60_000, timeout: 10_000 },
+    );
   }
 
   return (
@@ -251,7 +361,7 @@ export default function Home() {
           <span className="brand-mark"><span /></span>
           <span>plovdiv<span className="brand-light">/bus</span></span>
         </a>
-        <div className={`topbar-status ${streamState}`}><span className="status-dot" /> {streamState === "connected" ? `${vehicles.length} LIVE BUSES` : "LIVE FEED CONNECTING"}</div>
+        <div className={`topbar-status ${streamState}`}><span className="status-dot" /> {streamState === "connected" ? `${vehicles.length} LIVE BUSES` : streamState === "stale" ? "GPS POSITIONS STALE" : streamState === "reconnecting" ? "LIVE FEED RECONNECTING" : "LIVE FEED CONNECTING"}</div>
         <button className="icon-button" type="button" title="Refresh arrivals" onClick={() => void refresh(selectedStop?.id)}>
           <ArrowDownUp size={17} />
         </button>
@@ -343,7 +453,7 @@ export default function Home() {
               {tripLoading && !selectedTrip ? (
                 <div className="arrival-empty trip-empty">Loading bus stops...</div>
               ) : !selectedTrip ? (
-                <div className="arrival-empty trip-empty">{streamState !== "connected" ? "Waiting for the live trip feed..." : "Live trip details are unavailable for this bus."}</div>
+                <div className="arrival-empty trip-empty">{tripError || (streamState !== "connected" ? "Waiting for the live trip feed..." : "Live trip details are unavailable for this bus.")}</div>
               ) : (
                 <div className="trip-stop-list">
                   {selectedTrip.stops.map((tripStop, index) => {
@@ -374,35 +484,55 @@ export default function Home() {
           <section className="arrivals">
             <div className="arrivals-heading">
               <div><p className="eyebrow">SELECTED STOP</p><h3>Arrivals</h3></div>
-              <div className="arrival-meta"><Radio size={15} /><span>{receivedAt ? `Live update ${new Date(receivedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "Connecting live feed"}</span></div>
+              <div className="arrival-tools">
+                <div className="arrival-meta"><Radio size={15} /><span>{receivedAt ? `Live update ${new Date(receivedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}` : "Connecting live feed"}</span></div>
+                {selectedStop && <button className="location-check" type="button" onClick={requestLocation}>
+                  <LocateFixed size={14} /> {userLocation ? "Update location" : "Can I catch it?"}
+                </button>}
+              </div>
             </div>
+            {locationMessage && <p className="location-message" role="status">{locationMessage}{walkingMinutesToStop !== null && <> · Walk to this stop: {walkingMinutesToStop} min</>}</p>}
+            {userLocation && <div className="catch-settings" aria-label="Catchability estimate settings">
+              <label>Walking pace<select value={walkingSpeedKmh} onChange={(event) => setWalkingSpeedKmh(Number(event.target.value))}>
+                <option value={3.2}>Slow · 3.2 km/h</option><option value={4.8}>Average · 4.8 km/h</option><option value={6}>Brisk · 6 km/h</option>
+              </select></label>
+              <label>Arrival buffer<select value={bufferMinutes} onChange={(event) => setBufferMinutes(Number(event.target.value))}>
+                <option value={0}>None</option><option value={2}>2 min</option><option value={5}>5 min</option>
+              </select></label>
+            </div>}
             {selectedStop ? (
               <>
                 <div className="live-arrival-section">
                   <div className="subsection-heading"><span>LIVE BUS ETAS</span><span>{liveArrivals.length || "--"}</span></div>
-                  {liveArrivals.length ? liveArrivals.slice(0, 5).map((arrival) => (
-                    <button className="live-arrival-row" key={arrival.vehicle.id} onClick={() => setSelectedVehicleId(arrival.vehicle.id)}>
-                      <span className="route-badge live-badge">{arrival.vehicle.lineId}</span>
-                      <span className="arrival-destination">{arrival.vehicle.destination?.en || arrival.vehicle.destination?.bg || "Direction unavailable"}<small>Bus {arrival.vehicle.id.split("/").at(-1)}</small></span>
-                      <span className="arrival-time">{arrival.minutesAway === 0 ? "Due" : `${arrival.minutesAway} min`}</span>
-                      <span className="delay-label">{arrival.delayMs === 0 ? "On time" : `${Math.max(1, Math.round(Math.abs(arrival.delayMs) / 60_000))} min ${arrival.delayMs > 0 ? "late" : "early"}`}</span>
-                    </button>
-                  )) : (
-                    <div className="arrival-empty compact-empty">{liveArrivalLoading ? "Matching live buses to this stop..." : streamState !== "connected" ? "Waiting for live bus positions..." : "No currently tracked bus has this stop ahead on its trip."}</div>
+                  {liveArrivals.length ? liveArrivals.slice(0, 5).map((arrival) => {
+                    const catchability = walkingMinutesToStop === null ? null : getCatchability(arrival.minutesAway, walkingMinutesToStop, bufferMinutes);
+                    return (
+                      <button className="live-arrival-row" key={arrival.vehicle.id} onClick={() => setSelectedVehicleId(arrival.vehicle.id)}>
+                        <span className="route-badge live-badge">{arrival.vehicle.lineId}</span>
+                        <span className="arrival-destination">{arrival.vehicle.destination?.en || arrival.vehicle.destination?.bg || "Direction unavailable"}<small>Bus {arrival.vehicle.id.split("/").at(-1)}</small>{catchability && <small className={`catchability ${catchability.status}`}>{catchability.text}</small>}</span>
+                        <span className="arrival-time">{arrival.minutesAway === 0 ? "Due" : `${arrival.minutesAway} min`}</span>
+                        <span className="delay-label">{arrival.delayMs === 0 ? "On time" : `${Math.max(1, Math.round(Math.abs(arrival.delayMs) / 60_000))} min ${arrival.delayMs > 0 ? "late" : "early"}`}</span>
+                      </button>
+                    );
+                  }) : (
+                    <div className="arrival-empty compact-empty">{liveArrivalLoading ? "Matching live buses to this stop..." : liveArrivalError || (streamState === "reconnecting" ? "Live feed interrupted. Showing the published schedule below." : streamState === "stale" ? "GPS positions are stale. Waiting for fresh bus locations." : streamState !== "connected" ? "Waiting for live bus positions..." : "No currently tracked bus has this stop ahead on its trip.")}</div>
                   )}
                 </div>
                 <div className="schedule-section">
                   <div className="subsection-heading"><span>PUBLISHED SCHEDULE</span><span>{feed?.loadedAt ? new Date(feed.loadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}</span></div>
                   {feed?.arrivals?.length ? (
                     <div className="arrival-table">
-                      {feed.arrivals.slice(0, 6).map((arrival) => (
-                        <div className="arrival-row" key={`${arrival.tripId}-${arrival.departureTime}`}>
-                          <span className="route-badge">{arrival.route}</span>
-                          <span className="arrival-destination">{arrival.headsign || "Direction not listed"}</span>
-                          <span className="arrival-time">{arrival.minutesAway === 0 ? "Due" : `${arrival.minutesAway} min`}</span>
-                          <span className="scheduled-time">{arrival.departureTime.slice(0, 5)}</span>
-                        </div>
-                      ))}
+                      {feed.arrivals.slice(0, 6).map((arrival) => {
+                        const catchability = walkingMinutesToStop === null ? null : getCatchability(arrival.minutesAway, walkingMinutesToStop, bufferMinutes);
+                        return (
+                          <div className="arrival-row" key={`${arrival.tripId}-${arrival.departureTime}`}>
+                            <span className="route-badge">{arrival.route}</span>
+                            <span className="arrival-destination">{arrival.headsign || "Direction not listed"}{catchability && <small className={`catchability ${catchability.status}`}>{catchability.text} · scheduled</small>}</span>
+                            <span className="arrival-time">{arrival.minutesAway === 0 ? "Due" : `${arrival.minutesAway} min`}</span>
+                            <span className="scheduled-time">{arrival.departureTime.slice(0, 5)}</span>
+                          </div>
+                        );
+                      })}
                     </div>
                   ) : (
                     <div className="arrival-empty">{loading ? "Checking the timetable..." : feed?.error ?? "No upcoming departures found for this stop today."}</div>
@@ -413,7 +543,7 @@ export default function Home() {
               <div className="arrival-empty">Connect a verified GTFS feed to see stops and departures.</div>
             )}
             <p className="arrival-disclaimer">Live ETAs use the active vehicle trip and reported delay; they can still change with traffic or service updates. Scheduled times are shown separately.</p>
-            <div className="source-credit">Live vehicle data by <a href="https://livetransport.eu/#/plovdiv" target="_blank" rel="noreferrer">LiveTransport.eu</a> · Received {receivedAt ? `${Math.max(0, Math.floor((Date.now() - receivedAt) / 1000))} sec ago` : "not yet"}</div>
+            <div className="source-credit">Schedules by <a href="https://gtfs.livetransport.eu/" target="_blank" rel="noreferrer">LiveTransport.eu (CC BY 4.0)</a> · Live vehicle data by <a href="https://livetransport.eu/#/plovdiv" target="_blank" rel="noreferrer">LiveTransport.eu</a> · Received {receivedAt ? `${Math.max(0, Math.floor((Date.now() - receivedAt) / 1000))} sec ago` : "not yet"}</div>
           </section>
         </section>
       </section>

@@ -45,10 +45,17 @@ function getActiveServices(calendar: CsvRow[], exceptions: CsvRow[], date: strin
 
 async function loadFeed(): Promise<FeedData> {
   if (cachedFeed && Date.now() - cachedAt < cacheDurationMs) return cachedFeed;
-  const feedUrl = process.env.GTFS_STATIC_URL;
+  const feedUrl = process.env.GTFS_STATIC_URL?.trim();
   if (!feedUrl) throw new Error("Set GTFS_STATIC_URL to a verified public GTFS ZIP URL.");
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(feedUrl);
+  } catch {
+    throw new Error("GTFS_STATIC_URL must be a valid HTTPS URL.");
+  }
+  if (parsedUrl.protocol !== "https:") throw new Error("GTFS_STATIC_URL must use HTTPS.");
 
-  const response = await fetch(feedUrl, { next: { revalidate: 0 } });
+  const response = await fetch(parsedUrl, { cache: "no-store", signal: AbortSignal.timeout(20_000) });
   if (!response.ok) throw new Error(`GTFS download failed (${response.status}).`);
   const files = unzipSync(new Uint8Array(await response.arrayBuffer()));
   const stopRows = readCsv(files, "stops.txt");

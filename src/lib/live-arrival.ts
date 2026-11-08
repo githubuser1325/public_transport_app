@@ -4,7 +4,12 @@ export interface LiveStopArrival {
   delayMs: number;
 }
 
-type TripStop = { id: string; scheduled: number } | [string, number];
+export const maxLiveEtaMinutes = 180;
+const maxLiveEtaLatenessMs = 5 * 60_000;
+
+export function matchesLiveTripLine(tripLineId: string | null | undefined, expectedLineId: string): boolean {
+  return typeof tripLineId === "string" && tripLineId.trim() === expectedLineId.trim();
+}
 
 export function getLiveStopArrival(
   tripData: unknown,
@@ -15,25 +20,23 @@ export function getLiveStopArrival(
   const data = tripData as {
     nextStop?: unknown;
     delay?: unknown;
-    trip?: { stops?: unknown };
   };
-  const stops = data.trip?.stops;
-  if (!Array.isArray(stops) || !Number.isInteger(data.nextStop) || Number(data.nextStop) < 0 || Number(data.nextStop) >= stops.length) return null;
-  if (typeof data.delay !== "number" || !Number.isFinite(data.delay)) return null;
+  const nextStop = data.nextStop;
+  if (!Number.isInteger(nextStop) || Number(nextStop) < 0 || data.delay === "cancelled") return null;
 
-  const normalizedStops = stops as TripStop[];
-  const targetIndex = normalizedStops.findIndex((stop) => (Array.isArray(stop) ? stop[0] : stop.id) === stopId);
-  if (targetIndex < Number(data.nextStop)) return null;
+  const trip = normalizeLiveTrip(tripData);
+  if (!trip || Number(nextStop) >= trip.stops.length || trip.cancelled) return null;
+  const targetIndex = trip.stops.findIndex((stop, index) => index >= Number(nextStop) && stop.id === stopId);
+  if (targetIndex < 0) return null;
+  const target = trip.stops[targetIndex];
+  if (target.delayMs === null) return null;
 
-  const target = normalizedStops[targetIndex];
-  const scheduled = Array.isArray(target) ? target[1] : target?.scheduled;
-  if (typeof scheduled !== "number" || !Number.isFinite(scheduled)) return null;
-
-  const arrivalTime = scheduled + data.delay;
+  const arrivalTime = target.scheduledAt + target.delayMs;
+  if (arrivalTime - now > maxLiveEtaMinutes * 60_000 || arrivalTime < now - maxLiveEtaLatenessMs) return null;
   return {
     arrivalTime,
     minutesAway: Math.max(0, Math.ceil((arrivalTime - now) / 60_000)),
-    delayMs: data.delay,
+    delayMs: target.delayMs,
   };
 }
 
@@ -153,7 +156,7 @@ export function normalizeLiveTrip(payload: unknown): LiveTripDetails | null {
     lineId: typeof trip.lineId === "string" ? trip.lineId : "",
     destination,
     shape: typeof trip.shape === "string" ? trip.shape : "",
-    nextStop: Number.isInteger(response.nextStop) ? Number(response.nextStop) : 0,
+    nextStop: Number.isInteger(response.nextStop) ? Number(response.nextStop) : -1,
     delayMs: globalDelay,
     cancelled: response.delay === "cancelled",
     stops,

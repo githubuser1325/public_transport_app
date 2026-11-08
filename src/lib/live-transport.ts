@@ -12,7 +12,26 @@ export interface LiveVehicle {
   lastUpdated: number;
 }
 
-const staleAfterMs = 5 * 60 * 1000;
+export const staleAfterMs = 5 * 60 * 1000;
+export const recentPositionAfterMs = 90_000;
+export const noInitialPositionTimeoutMs = 30_000;
+const allowedClockSkewMs = 60_000;
+
+export function isLiveVehicleFresh(vehicle: LiveVehicle, now = Date.now()): boolean {
+  const age = now - vehicle.lastUpdated;
+  return age >= -allowedClockSkewMs && age <= staleAfterMs;
+}
+
+export function isLiveVehicleRecent(vehicle: LiveVehicle, now = Date.now()): boolean {
+  const age = now - vehicle.lastUpdated;
+  return age >= -allowedClockSkewMs && age <= recentPositionAfterMs;
+}
+
+export function hasLiveStreamGoneStale(lastPositionAt: number | null, connectedAt: number, now = Date.now()): boolean {
+  const lastSignalAt = lastPositionAt ?? connectedAt;
+  const timeout = lastPositionAt === null ? noInitialPositionTimeoutMs : recentPositionAfterMs;
+  return now - lastSignalAt > timeout;
+}
 
 export function parseLiveTransportMessage(payload: unknown): LiveVehicle[] {
   let parsed = payload;
@@ -41,6 +60,8 @@ export function parseLiveTransportMessage(payload: unknown): LiveVehicle[] {
       typeof coordinates[1] !== "number" ||
       !Number.isFinite(coordinates[0]) ||
       !Number.isFinite(coordinates[1]) ||
+      coordinates[0] < -90 || coordinates[0] > 90 ||
+      coordinates[1] < -180 || coordinates[1] > 180 ||
       typeof lastUpdated !== "number" ||
       !Number.isFinite(lastUpdated)
     ) return [];
@@ -71,6 +92,10 @@ export function mergeLiveVehicleUpdates(
   now = Date.now(),
 ): LiveVehicle[] {
   const merged = new Map(current.map((vehicle) => [vehicle.id, vehicle]));
-  for (const vehicle of updates) merged.set(vehicle.id, vehicle);
-  return [...merged.values()].filter((vehicle) => now - vehicle.lastUpdated <= staleAfterMs);
+  for (const vehicle of updates) {
+    if (!isLiveVehicleFresh(vehicle, now)) continue;
+    const currentVehicle = merged.get(vehicle.id);
+    if (!currentVehicle || vehicle.lastUpdated >= currentVehicle.lastUpdated) merged.set(vehicle.id, vehicle);
+  }
+  return [...merged.values()].filter((vehicle) => isLiveVehicleFresh(vehicle, now));
 }
