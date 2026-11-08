@@ -1,16 +1,70 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getUpcomingArrivals, parseGtfsTime } from "./gtfs";
+import { getActiveServices, getPlovdivClock, getPreviousServiceDay, getServiceDayScheduleRows, getUpcomingArrivals, parseGtfsTime, shiftOvernightGtfsTimeToCurrentDay } from "./gtfs";
 import { assessCatchability, estimateWalkingMinutes } from "./catchability";
 import { decodeTripShape, getLiveStopArrival, matchesLiveTripLine, normalizeLiveTrip } from "./live-arrival";
 import { getVisibleLiveVehicles, hasLiveStreamGoneStale, isLiveVehicleFresh, isLiveVehicleRecent, mergeLiveVehicleUpdates, parseLiveTransportMessage, type LiveVehicle } from "./live-transport";
 import { startLiveConnection, type LiveSocket } from "./live-connection";
-import { readCurrentLocation, type GeolocationPort, type LocationResult } from "./location";
+import { getLocationFallbackMessage, readCurrentLocation, type GeolocationPort, type LocationResult } from "./location";
+import { getTransitRequestPath } from "./transit-request";
+
+test("requests the selected stop timetable after stop selection", () => {
+  assert.equal(getTransitRequestPath(), "/api/transit");
+  assert.equal(getTransitRequestPath("9458"), "/api/transit?stopId=9458");
+  assert.equal(getTransitRequestPath("stop id/1"), "/api/transit?stopId=stop%20id%2F1");
+});
 
 test("parses GTFS times, including trips after midnight", () => {
   assert.equal(parseGtfsTime("07:05:09"), 25_509);
   assert.equal(parseGtfsTime("25:10:00"), 90_600);
   assert.equal(parseGtfsTime("07:61:00"), null);
+});
+
+test("uses Plovdiv local date and weekday across UTC midnight and the DST clock change", () => {
+  assert.deepEqual(getPlovdivClock(new Date("2026-11-08T22:30:00.000Z")), {
+    date: "20261109", seconds: 1_800, weekday: 1,
+  });
+  assert.deepEqual(getPlovdivClock(new Date("2026-10-25T00:30:00.000Z")), {
+    date: "20261025", seconds: 12_600, weekday: 0,
+  });
+  assert.deepEqual(getPreviousServiceDay("20261109", 1), { date: "20261108", weekday: 0 });
+});
+
+test("applies calendar exceptions and includes prior service-day trips only after midnight", () => {
+  const calendar = [
+    { service_id: "weekday", start_date: "20260101", end_date: "20261231", sunday: "0", monday: "1", tuesday: "1", wednesday: "1", thursday: "1", friday: "1", saturday: "0" },
+    { service_id: "weekend", start_date: "20260101", end_date: "20261231", sunday: "1", monday: "0", tuesday: "0", wednesday: "0", thursday: "0", friday: "0", saturday: "1" },
+    { service_id: "daily", start_date: "20260101", end_date: "20261231", sunday: "1", monday: "1", tuesday: "1", wednesday: "1", thursday: "1", friday: "1", saturday: "1" },
+  ];
+  const exceptions = [
+    { service_id: "weekday", date: "20261109", exception_type: "2" },
+    { service_id: "special", date: "20261109", exception_type: "1" },
+  ];
+  assert.deepEqual([...getActiveServices(calendar, exceptions, "20261109", 1)].sort(), ["daily", "special"]);
+
+  const rows = [
+    { tripId: "today", serviceId: "special", route: "1", headsign: "Center", departureTime: "06:00:00" },
+    { tripId: "overnight", serviceId: "weekend", route: "2", headsign: "South", departureTime: "25:10:00" },
+    { tripId: "old-time", serviceId: "weekend", route: "2", headsign: "South", departureTime: "23:50:00" },
+    { tripId: "too-late", serviceId: "weekend", route: "2", headsign: "South", departureTime: "49:00:00" },
+    { tripId: "cancelled-overnight", serviceId: "weekday", route: "3", headsign: "North", departureTime: "25:20:00" },
+    { tripId: "daily-overnight", serviceId: "daily", route: "4", headsign: "Airport", departureTime: "25:30:00" },
+  ];
+  const currentDayRows = getServiceDayScheduleRows(rows, calendar, exceptions, "20261109", 1);
+  assert.deepEqual(currentDayRows.map(({ tripId, departureTime }) => [tripId, departureTime]), [
+    ["today", "06:00:00"],
+    ["overnight", "01:10:00"],
+    ["daily-overnight", "25:30:00"],
+    ["daily-overnight", "01:30:00"],
+  ]);
+  const afterMidnightArrivals = getUpcomingArrivals(currentDayRows, 30 * 60);
+  assert.deepEqual(afterMidnightArrivals.slice(0, 2).map(({ tripId, minutesAway }) => [tripId, minutesAway]), [
+    ["overnight", 40],
+    ["daily-overnight", 60],
+  ]);
+  assert.equal(shiftOvernightGtfsTimeToCurrentDay("24:00:00"), "00:00:00");
+  assert.equal(shiftOvernightGtfsTimeToCurrentDay("47:59:59"), "23:59:59");
+  assert.equal(shiftOvernightGtfsTimeToCurrentDay("48:00:00"), null);
 });
 
 test("returns only future arrivals in chronological order", () => {
@@ -160,7 +214,7 @@ test("reconnects after a socket close and accepts GPS updates from the recovered
   const stop = startLiveConnection({
     url: "wss://example.test/feed",
     createSocket: () => {
-      const socket: LiveSocket = { onmessage: null, onerror: null, onclose: null, close() {} };
+      const socket: LiveSocket = { onopen: null, onmessage: null, onerror: null, onclose: null, close() {} };
       sockets.push(socket);
       return socket;
     },
@@ -174,6 +228,9 @@ test("reconnects after a socket close and accepts GPS updates from the recovered
     cancel: () => { cancelled = true; },
   });
 
+  assert.equal(states[0], "connecting");
+  sockets[0].onopen?.(new Event("open"));
+  assert.equal(states.at(-1), "connected", "an open WebSocket should be reported before GPS arrives");
   sockets[0].onerror?.(new Event("error"));
   sockets[0].onclose?.(new CloseEvent("close"));
   sockets[0].onclose?.(new CloseEvent("close"));
@@ -222,6 +279,11 @@ test("handles geolocation approval, refusal, timeout, unavailability and local w
   assert.match(unavailableResult?.status === "error" ? unavailableResult.message : "", /Could not get/);
   assert.match(timeoutResult?.status === "error" ? timeoutResult.message : "", /timed out/i);
   assert.match(missingResult?.status === "error" ? missingResult.message : "", /not available/i);
+  for (const result of [deniedResult, unavailableResult, timeoutResult, missingResult]) {
+    assert.equal(result?.status, "error");
+    assert.match(getLocationFallbackMessage(result.message), /location is optional/i);
+    assert.match(getLocationFallbackMessage(result.message), /arrival times below/i);
+  }
 });
 
 test("allows another location attempt after the user previously denied access", () => {

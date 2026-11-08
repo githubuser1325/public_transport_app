@@ -12,6 +12,10 @@ export type LocationResult =
   | { status: "success"; coordinates: Coordinates }
   | { status: "error"; message: string };
 
+export function getLocationFallbackMessage(message: string): string {
+  return `${message} Location is optional; use the arrival times below without a walking estimate.`;
+}
+
 export function readCurrentLocation(
   geolocation: GeolocationPort | undefined,
   complete: (result: LocationResult) => void,

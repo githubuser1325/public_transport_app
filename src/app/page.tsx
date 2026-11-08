@@ -7,7 +7,8 @@ import type { Arrival, Stop } from "@/lib/gtfs";
 import { assessCatchability, estimateWalkingMinutes, type Coordinates } from "@/lib/catchability";
 import { decodeTripShape, type LiveTripDetails } from "@/lib/live-arrival";
 import { startLiveConnection } from "@/lib/live-connection";
-import { readCurrentLocation } from "@/lib/location";
+import { getLocationFallbackMessage, readCurrentLocation } from "@/lib/location";
+import { getTransitRequestPath } from "@/lib/transit-request";
 import { getVisibleLiveVehicles, hasLiveStreamGoneStale, isLiveVehicleFresh, isLiveVehicleRecent, mergeLiveVehicleUpdates, parseLiveTransportMessage, type LiveVehicle } from "@/lib/live-transport";
 
 const TransitMap = dynamic(() => import("@/components/TransitMap"), {
@@ -82,7 +83,18 @@ export default function Home() {
   const lastPositionUpdateRef = useRef<number | null>(null);
   const feedRequestControllerRef = useRef<AbortController | null>(null);
   liveVehiclesRef.current = vehicles;
+  const visibleVehicles = getVisibleLiveVehicles(vehicles);
   const selectedVehicle = vehicles.find((vehicle) => vehicle.id === selectedVehicleId && isLiveVehicleRecent(vehicle)) ?? null;
+  const liveStatusLabel = streamState === "connected"
+    ? visibleVehicles.length ? `${visibleVehicles.length} LIVE BUSES` : "CONNECTED · WAITING FOR GPS"
+    : streamState === "stale"
+      ? receivedAt ? "GPS POSITIONS STALE" : "CONNECTED · NO GPS DATA"
+      : streamState === "reconnecting" ? "LIVE FEED RECONNECTING" : "LIVE FEED CONNECTING";
+  const positionStatusLabel = streamState === "connected"
+    ? visibleVehicles.length ? "LIVE" : "WAITING"
+    : streamState === "stale"
+      ? receivedAt ? "STALE" : "NO GPS"
+      : streamState === "reconnecting" ? "RETRYING" : "CONNECTING";
   const stopsById = useMemo(() => new Map((feed?.stops ?? []).map((stop) => [stop.id, stop])), [feed?.stops]);
   const tripStopKey = selectedTrip?.stops.map((stop) => stop.id).join(",") ?? "";
   const selectedTripShape = useMemo(() => {
@@ -100,8 +112,7 @@ export default function Home() {
     feedRequestControllerRef.current = controller;
     setLoading(true);
     try {
-      const query = stopId ? `?stopId=${encodeURIComponent(stopId)}` : "";
-      const response = await fetch(`/api/transit${query}`, { cache: "no-store", signal: controller.signal });
+      const response = await fetch(getTransitRequestPath(stopId), { cache: "no-store", signal: controller.signal });
       const data = (await response.json()) as TransitResponse;
       if (!response.ok) throw new Error(data.error || "Transit schedule is temporarily unavailable.");
       if (controller.signal.aborted) return;
@@ -125,7 +136,19 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    const focusStopSearch = (event: KeyboardEvent) => {
+      if (event.key !== "/" || event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target;
+      if (target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
+      event.preventDefault();
+      document.getElementById("stop-search")?.focus();
+    };
+    window.addEventListener("keydown", focusStopSearch);
+    return () => window.removeEventListener("keydown", focusStopSearch);
+  }, []);
+
+  useEffect(() => {
+    void refresh(selectedStop?.id);
     const timer = window.setInterval(() => void refresh(selectedStop?.id), 60_000);
     return () => {
       window.clearInterval(timer);
@@ -312,6 +335,9 @@ export default function Home() {
     const normalized = search.trim().toLocaleLowerCase();
     return (feed?.stops ?? []).filter((stop) => stop.name.toLocaleLowerCase().includes(normalized));
   }, [feed?.stops, search]);
+  const selectedStopOutsideSearch = Boolean(
+    search.trim() && selectedStop && !filteredStops.some((stop) => stop.id === selectedStop.id),
+  );
   const walkingMinutesToStop = userLocation && selectedStop
     ? estimateWalkingMinutes(userLocation, selectedStop, walkingSpeedKmh)
     : null;
@@ -325,13 +351,14 @@ export default function Home() {
   }
 
   function requestLocation() {
+    setUserLocation(null);
     setLocationMessage("Checking your location…");
-    readCurrentLocation(navigator.geolocation, (result) => {
+    readCurrentLocation(typeof navigator === "undefined" ? undefined : navigator.geolocation, (result) => {
       if (result.status === "success") {
         setUserLocation(result.coordinates);
         setLocationMessage("Location stays on this device; walk time is approximate.");
       } else {
-        setLocationMessage(result.message);
+        setLocationMessage(getLocationFallbackMessage(result.message));
       }
     });
   }
@@ -343,8 +370,8 @@ export default function Home() {
           <span className="brand-mark"><span /></span>
           <span>plovdiv<span className="brand-light">/bus</span></span>
         </a>
-        <div className={`topbar-status ${streamState}`}><span className="status-dot" /> {streamState === "connected" ? `${getVisibleLiveVehicles(vehicles).length} LIVE BUSES` : streamState === "stale" ? "GPS POSITIONS STALE" : streamState === "reconnecting" ? "LIVE FEED RECONNECTING" : "LIVE FEED CONNECTING"}</div>
-        <button className="icon-button" type="button" title="Refresh arrivals" onClick={() => void refresh(selectedStop?.id)}>
+        <div className={`topbar-status ${streamState}`} role="status" aria-live="polite" aria-atomic="true"><span className="status-dot" /> {liveStatusLabel}</div>
+        <button className="icon-button" type="button" aria-label="Refresh arrivals" title="Refresh arrivals" onClick={() => void refresh(selectedStop?.id)}>
           <ArrowDownUp size={17} />
         </button>
       </header>
@@ -364,11 +391,16 @@ export default function Home() {
 
           <div className="stop-section">
             <div className="section-heading"><span>Choose a stop</span><span className="stop-count">{feed?.stops?.length ?? "--"}</span></div>
-            <label className="search-box">
+            <label className="search-box" htmlFor="stop-search">
               <Search size={16} />
-              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search stops" />
+              <input id="stop-search" aria-keyshortcuts="/" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search stops" />
               <kbd>/</kbd>
             </label>
+            {selectedStopOutsideSearch && selectedStop && (
+              <p className="search-selection-note" role="status" aria-live="polite">
+                Map and arrivals still show <strong>{selectedStop.name}</strong>. Choose a result to switch stops.
+              </p>
+            )}
             <div className="stop-list">
               {filteredStops.slice(0, 250).map((stop) => (
                 <button key={stop.id} className={`stop-row ${selectedStop?.id === stop.id ? "selected" : ""}`} onClick={() => void chooseStop(stop)}>
@@ -377,6 +409,9 @@ export default function Home() {
                   {selectedStop?.id === stop.id && <span className="row-arrow">↗</span>}
                 </button>
               ))}
+              {!loading && Boolean(feed?.stops?.length) && filteredStops.length === 0 && (
+                <div className="empty-stops search-empty"><strong>No stops found</strong><span>Try a different stop name.</span></div>
+              )}
               {!loading && !feed?.stops?.length && (
                 <div className="empty-stops">
                   <Signal size={20} />
@@ -387,7 +422,7 @@ export default function Home() {
               {filteredStops.length > 250 && <p className="list-limit">Showing 250 matches. Refine your search.</p>}
             </div>
           </div>
-          <div className="sidebar-foot"><span>SCHEDULE</span><strong>GTFS</strong><span className="foot-divider" /> <span>POSITIONS</span><strong>LIVE</strong></div>
+          <div className="sidebar-foot"><span>SCHEDULE</span><strong>GTFS</strong><span className="foot-divider" /> <span>GPS</span><strong className={`position-status ${streamState}`} aria-label={`GPS positions ${positionStatusLabel.toLowerCase()}`}>{positionStatusLabel}</strong></div>
         </aside>
 
         <section className="main-panel">
@@ -398,7 +433,7 @@ export default function Home() {
           <div className="map-wrap">
             <TransitMap
               stops={feed?.stops ?? []}
-              vehicles={getVisibleLiveVehicles(vehicles)}
+              vehicles={visibleVehicles}
               routeShape={selectedTripShape}
               selectedStopId={selectedStop?.id ?? null}
               selectedVehicleId={selectedVehicleId}

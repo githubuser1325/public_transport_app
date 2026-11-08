@@ -13,6 +13,73 @@ export interface Arrival {
   minutesAway: number;
 }
 
+export type CalendarRow = Record<string, string>;
+export interface ScheduledStopTime {
+  tripId: string;
+  serviceId: string;
+  route: string;
+  headsign: string;
+  departureTime: string;
+}
+
+const weekdayColumns = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
+export function getActiveServices(calendar: CalendarRow[], exceptions: CalendarRow[], date: string, weekday: number): Set<string> {
+  const active = new Set<string>();
+  for (const row of calendar) {
+    if (date >= row.start_date && date <= row.end_date && row[weekdayColumns[weekday]] === "1") active.add(row.service_id);
+  }
+  for (const row of exceptions) {
+    if (row.date !== date) continue;
+    if (row.exception_type === "1") active.add(row.service_id);
+    if (row.exception_type === "2") active.delete(row.service_id);
+  }
+  return active;
+}
+
+export function getPreviousServiceDay(date: string, weekday: number): { date: string; weekday: number } {
+  const year = Number(date.slice(0, 4));
+  const month = Number(date.slice(4, 6));
+  const day = Number(date.slice(6, 8));
+  const previous = new Date(Date.UTC(year, month - 1, day - 1));
+  const padded = (value: number) => String(value).padStart(2, "0");
+  return {
+    date: `${previous.getUTCFullYear()}${padded(previous.getUTCMonth() + 1)}${padded(previous.getUTCDate())}`,
+    weekday: (weekday + 6) % 7,
+  };
+}
+
+export function shiftOvernightGtfsTimeToCurrentDay(value: string): string | null {
+  const seconds = parseGtfsTime(value);
+  if (seconds === null || seconds < 86_400 || seconds >= 172_800) return null;
+  const currentDaySeconds = seconds - 86_400;
+  const hours = Math.floor(currentDaySeconds / 3600);
+  const minutes = Math.floor((currentDaySeconds % 3600) / 60);
+  const remainder = currentDaySeconds % 60;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+export function getServiceDayScheduleRows(
+  rows: ScheduledStopTime[],
+  calendar: CalendarRow[],
+  exceptions: CalendarRow[],
+  date: string,
+  weekday: number,
+): Omit<ScheduledStopTime, "serviceId">[] {
+  const activeToday = getActiveServices(calendar, exceptions, date, weekday);
+  const previousDay = getPreviousServiceDay(date, weekday);
+  const activePreviousDay = getActiveServices(calendar, exceptions, previousDay.date, previousDay.weekday);
+
+  return rows.flatMap(({ serviceId, ...row }) => {
+    const serviceRows = activeToday.has(serviceId) ? [row] : [];
+    if (activePreviousDay.has(serviceId)) {
+      const departureTime = shiftOvernightGtfsTimeToCurrentDay(row.departureTime);
+      if (departureTime) serviceRows.push({ ...row, departureTime });
+    }
+    return serviceRows;
+  });
+}
+
 export function parseGtfsTime(value: string): number | null {
   const match = /^(\d{1,3}):(\d{2}):(\d{2})$/.exec(value);
   if (!match) return null;

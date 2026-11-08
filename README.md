@@ -6,6 +6,8 @@ Select a bus to highlight its route and inspect the full stop sequence with time
 
 Use **Can I catch it?** in the arrivals panel to compare a one-time location reading with live and scheduled arrivals. Location is processed in the browser and is not sent to the server.
 
+Press `/` to focus stop search. The project design, academic description, data attribution, testing approach and known limitations are documented in [`docs/`](docs/).
+
 ## Requirements
 
 - Node.js LTS and npm
